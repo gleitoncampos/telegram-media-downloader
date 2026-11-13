@@ -4,13 +4,16 @@ Telegram Group Downloader
 Baixa vídeos e arquivos de grupos do Telegram via API (MTProto).
 """
 
+import atexit
 import os
 import re
 import sys
+import unicodedata
 import asyncio
 import json
 import logging
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -35,18 +38,48 @@ COURSE_STRUCTURE_FILE = Path(__file__).parent / "course_structure.json"
 MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 5
 MAX_RETRY_DELAY = 300
-MAX_CONCURRENT_DOWNLOADS = 3
+MAX_CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_DELAY = 1.0
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(Path(__file__).parent / "downloader.log"),
-        logging.StreamHandler(),
-    ],
-)
 logger = logging.getLogger(__name__)
+LOGS_DIR = Path(__file__).parent / "logs"
+
+
+def setup_logging() -> Path:
+    """Cria um arquivo de log novo para esta execução (logs/downloader_AAAAMMDD_HHMMSS.log).
+
+    Arquivo: INFO+ (grupos, opções, cada arquivo baixado, erros). Terminal: só WARNING+.
+    """
+    LOGS_DIR.mkdir(exist_ok=True)
+    log_path = LOGS_DIR / f"downloader_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[file_handler, console_handler],
+    )
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logger.info("Execução iniciada (log: %s)", log_path.name)
+    atexit.register(logger.info, "Execução encerrada")
+    return log_path
+
+
+def log_selection(queue, media_label: str, limit, destination: str, course_structure, post_actions):
+    """Registra no log os grupos e as opções escolhidas para este lote de downloads."""
+    logger.info("=" * 60)
+    logger.info("Novo lote de downloads: %d grupo(s)", len(queue))
+    for n, g in enumerate(queue, 1):
+        logger.info("  Grupo %d/%d: %s", n, len(queue), g.name)
+    logger.info("Mídia: %s", media_label)
+    logger.info("Limite de mensagens: %s", limit if limit else "todas")
+    logger.info("Destino: %s", destination)
+    logger.info("Organização por pastas (course_structure): %s", "sim" if course_structure else "não")
+    logger.info("Downloads simultâneos: %d", MAX_CONCURRENT_DOWNLOADS)
+    logger.info("Ação ao terminar: %s", ", ".join(POST_ACTIONS[k] for k in sorted(post_actions)))
+    logger.info("=" * 60)
 
 MEDIA_FILTERS = {
     "1": {"label": "Apenas vídeos", "types": ["video"]},
@@ -206,30 +239,100 @@ def classify_media(message) -> str | None:
     return None
 
 
-class DownloadProgress:
+class LiveProgress:
+    """Bloco fixo no fim do terminal com uma linha (barra, %, velocidade, ETA) por download ativo."""
+
+    BAR_LENGTH = 20
+    MIN_REDRAW_INTERVAL = 0.2
+    SPEED_SMOOTHING = 0.3
+
     def __init__(self):
-        self.start_time = time.time()
+        self.active: dict[int, dict] = {}
+        self._next_id = 0
+        self._drawn_lines = 0
+        self._last_draw = 0.0
+        self.enabled = sys.stdout.isatty()
 
-    def callback(self, current, total):
-        if total <= 0:
+    def start(self, name: str):
+        self._next_id += 1
+        task_id = self._next_id
+        now = time.time()
+        self.active[task_id] = {
+            "name": name, "current": 0, "total": 0,
+            "last_time": now, "last_bytes": 0, "speed": 0.0,
+        }
+        self._draw(force=True)
+
+        def callback(current, total):
+            self._update(task_id, current, total)
+
+        return task_id, callback
+
+    def finish(self, task_id: int):
+        self.active.pop(task_id, None)
+        self._draw(force=True)
+
+    def log(self, text: str = ""):
+        """print() que não quebra o bloco de progresso."""
+        self._clear()
+        print(text)
+        self._draw(force=True)
+
+    def _update(self, task_id: int, current: int, total: int):
+        task = self.active.get(task_id)
+        if task is None or total <= 0:
             return
-        elapsed = time.time() - self.start_time
-        speed = current / elapsed if elapsed > 0.5 else 0
-        remaining = (total - current) / speed if speed > 0 else 0
+        now = time.time()
+        task["current"], task["total"] = current, total
+        interval = now - task["last_time"]
+        if interval >= 0.5:
+            sample = (current - task["last_bytes"]) / interval
+            task["speed"] = (
+                sample if task["speed"] == 0
+                else self.SPEED_SMOOTHING * sample + (1 - self.SPEED_SMOOTHING) * task["speed"]
+            )
+            task["last_time"], task["last_bytes"] = now, current
+        self._draw()
 
-        percent = (current / total) * 100
-        bar_length = 30
-        filled = int(bar_length * current // total)
-        bar = "█" * filled + "░" * (bar_length - filled)
+    def _format_line(self, task: dict, width: int) -> str:
+        current, total, speed = task["current"], task["total"], task["speed"]
+        if total > 0:
+            filled = int(self.BAR_LENGTH * current // total)
+            bar = "█" * filled + "░" * (self.BAR_LENGTH - filled)
+            percent = f"{current / total * 100:5.1f}%"
+            speed_str = f"{format_size(int(speed))}/s" if speed > 0 else "..."
+            eta = time.strftime("%M:%S", time.gmtime((total - current) / speed)) if speed > 0 else "--:--"
+            info = f"[{bar}] {percent} {format_size(current)}/{format_size(total)} {speed_str} ETA {eta}"
+        else:
+            info = f"[{'░' * self.BAR_LENGTH}]   0.0% iniciando..."
+        name_width = max(10, width - len(info) - 4)
+        name = task["name"]
+        if len(name) > name_width:
+            name = name[: name_width - 1] + "…"
+        return f"  {name.ljust(name_width)} {info}"[: width - 1]
 
-        speed_str = f"{format_size(int(speed))}/s" if speed > 0 else "calculando..."
-        eta_str = time.strftime("%M:%S", time.gmtime(remaining)) if speed > 0 else "--:--"
+    def _clear(self):
+        if self.enabled and self._drawn_lines:
+            sys.stdout.write(f"\033[{self._drawn_lines}F\033[J")
+            self._drawn_lines = 0
 
-        sys.stdout.write(
-            f"\r  [{bar}] {percent:.1f}% ({format_size(current)}/{format_size(total)}) "
-            f"{speed_str} ETA: {eta_str}  "
-        )
+    def _draw(self, force: bool = False):
+        if not self.enabled:
+            return
+        now = time.time()
+        if not force and now - self._last_draw < self.MIN_REDRAW_INTERVAL:
+            return
+        self._last_draw = now
+        self._clear()
+        width = shutil.get_terminal_size((100, 24)).columns
+        lines = [self._format_line(t, width) for t in self.active.values()]
+        if lines:
+            sys.stdout.write("\n".join(lines) + "\n")
+            self._drawn_lines = len(lines)
         sys.stdout.flush()
+
+
+live = LiveProgress()
 
 
 def load_download_log() -> dict:
@@ -281,21 +384,22 @@ def check_disk_space(path: Path, required_bytes: int) -> bool:
 
 async def download_with_retry(
     client: TelegramClient, entity, message_id: int, file_path: Path, expected_size: int | None,
-    show_progress: bool = True, drive_service=None, drive_folder_id: str | None = None,
+    drive_service=None, drive_folder_id: str | None = None,
     file_name: str | None = None,
 ) -> bool:
     is_drive = drive_service is not None and drive_folder_id is not None
     attempt = 1
     while attempt <= MAX_RETRIES:
         writer = None
+        task_id = None
         try:
             fresh_message = await client.get_messages(entity, ids=message_id)
             if fresh_message is None:
                 logger.warning("Mensagem %d não encontrada ao re-buscar", message_id)
-                print(f"\n  ⚠  Mensagem {message_id} não encontrada no grupo")
+                live.log(f"\n  ⚠  Mensagem {message_id} não encontrada no grupo")
                 return False
 
-            progress = DownloadProgress() if show_progress else None
+            task_id, progress_cb = live.start(file_name or file_path.name)
 
             if is_drive:
                 from google_drive_upload import GoogleDriveWriter, get_mime_type
@@ -307,18 +411,16 @@ async def download_with_retry(
                 result = await client.download_media(
                     fresh_message,
                     file=writer,
-                    progress_callback=progress.callback if progress else None,
+                    progress_callback=progress_cb,
                 )
-                if show_progress:
-                    print()
                 writer.close()
 
                 if writer.tell() == 0:
                     logger.warning("Download vazio (Drive): %s (tentativa %d/%d)", file_name, attempt, MAX_RETRIES)
                     if attempt < MAX_RETRIES:
                         delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-                        print(f"\n  ⚠  Download vazio: {file_name}")
-                        print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                        live.log(f"\n  ⚠  Download vazio: {file_name}")
+                        live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
                         await asyncio.sleep(delay)
                     attempt += 1
                     continue
@@ -327,8 +429,8 @@ async def download_with_retry(
                     logger.warning("Upload não finalizado (Drive): %s (tentativa %d/%d)", file_name, attempt, MAX_RETRIES)
                     if attempt < MAX_RETRIES:
                         delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-                        print(f"\n  ⚠  Upload não concluído: {file_name}")
-                        print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                        live.log(f"\n  ⚠  Upload não concluído: {file_name}")
+                        live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
                         await asyncio.sleep(delay)
                     attempt += 1
                     continue
@@ -339,10 +441,8 @@ async def download_with_retry(
             result = await client.download_media(
                 fresh_message,
                 file=str(file_path),
-                progress_callback=progress.callback if progress else None,
+                progress_callback=progress_cb,
             )
-            if show_progress:
-                print()
 
             if result is None:
                 if file_path.exists():
@@ -350,8 +450,8 @@ async def download_with_retry(
                 logger.warning("download_media retornou None: %s (tentativa %d/%d)", file_path.name, attempt, MAX_RETRIES)
                 if attempt < MAX_RETRIES:
                     delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-                    print(f"\n  ⚠  Download silencioso falhou: {file_path.name}")
-                    print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                    live.log(f"\n  ⚠  Download silencioso falhou: {file_path.name}")
+                    live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
                     await asyncio.sleep(delay)
                 attempt += 1
                 continue
@@ -361,8 +461,8 @@ async def download_with_retry(
                 logger.warning("Arquivo não encontrado após download: %s (tentativa %d/%d)", result_path.name, attempt, MAX_RETRIES)
                 if attempt < MAX_RETRIES:
                     delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-                    print(f"\n  ⚠  Arquivo não encontrado: {file_path.name}")
-                    print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                    live.log(f"\n  ⚠  Arquivo não encontrado: {file_path.name}")
+                    live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
                     await asyncio.sleep(delay)
                 attempt += 1
                 continue
@@ -375,8 +475,8 @@ async def download_with_retry(
                 file_path.unlink()
                 if attempt < MAX_RETRIES:
                     delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-                    print(f"\n  ⚠  Arquivo vazio: {file_path.name}")
-                    print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+                    live.log(f"\n  ⚠  Arquivo vazio: {file_path.name}")
+                    live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
                     await asyncio.sleep(delay)
                 attempt += 1
                 continue
@@ -386,12 +486,12 @@ async def download_with_retry(
         except asyncio.CancelledError:
             if not is_drive and file_path.exists():
                 file_path.unlink()
-                print(f"\n  🗑  Arquivo incompleto removido: {file_path.name}")
+                live.log(f"\n  🗑  Arquivo incompleto removido: {file_path.name}")
             raise
 
         except errors.FloodWaitError as e:
             wait_time = e.seconds + 5
-            print(f"\n  ⏳ Flood wait do Telegram: aguardando {wait_time}s antes de retentar...")
+            live.log(f"\n  ⏳ Flood wait do Telegram: aguardando {wait_time}s antes de retentar...")
             logger.warning("FloodWaitError: aguardando %ds", wait_time)
             if not is_drive and file_path.exists():
                 file_path.unlink()
@@ -400,8 +500,8 @@ async def download_with_retry(
 
         except (ConnectionError, TimeoutError, OSError) as e:
             delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-            print(f"\n  🔌 Erro de conexão: {e}")
-            print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+            live.log(f"\n  🔌 Erro de conexão: {e}")
+            live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
             logger.warning("Erro de conexão: %s (tentativa %d/%d, retry em %ds)", e, attempt, MAX_RETRIES, delay)
             if not is_drive and file_path.exists():
                 file_path.unlink()
@@ -410,13 +510,17 @@ async def download_with_retry(
 
         except Exception as e:
             delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
-            print(f"\n  ❌ Erro inesperado: {e}")
-            print(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
+            live.log(f"\n  ❌ Erro inesperado: {e}")
+            live.log(f"     Tentativa {attempt}/{MAX_RETRIES} — retentando em {delay}s...")
             logger.warning("Erro inesperado: %s (tentativa %d/%d)", e, attempt, MAX_RETRIES)
             if not is_drive and file_path.exists():
                 file_path.unlink()
             await asyncio.sleep(delay)
             attempt += 1
+
+        finally:
+            if task_id is not None:
+                live.finish(task_id)
 
     display_name = file_name if is_drive else file_path.name
     logger.error("Falha permanente após %d tentativas: %s", MAX_RETRIES, display_name)
@@ -579,7 +683,12 @@ async def download_media_from_group(
     client: TelegramClient, group, media_types: list[str], limit: int | None,
     base_dir: Path | None = None, course_structure: dict | None = None,
     drive_service=None, drive_root_folder_id: str | None = None,
-):
+    interactive: bool = True,
+) -> int:
+    """Baixa a mídia de um grupo. Retorna o número de falhas (0 = tudo certo).
+
+    Com interactive=False (modo fila) não pede confirmação: segue direto.
+    """
     group_name = sanitize_filename(group.name)
     is_drive = drive_service is not None and drive_root_folder_id is not None
 
@@ -608,13 +717,19 @@ async def download_media_from_group(
         course_structure, drive_service, drive_group_folder_id,
     )
     if stats is None:
+        logger.error("Grupo '%s': falha ao escanear", group.name)
         print("❌ Falha ao escanear o grupo. Verifique sua conexão.\n")
-        return
+        return 1
 
     total_items = sum(stats["counts"].values())
+    logger.info(
+        "Grupo '%s': %d vídeos, %d fotos, %d documentos (~%s) | %d para baixar, %d já existiam",
+        group.name, stats["counts"]["video"], stats["counts"]["photo"], stats["counts"]["document"],
+        format_size(stats["total_size"]), len(pending), skipped,
+    )
     if total_items == 0:
         print("❌ Nenhuma mídia encontrada com os filtros selecionados.\n")
-        return
+        return 0
 
     print(f"  {'='*45}")
     print(f"  RESUMO DO GRUPO")
@@ -635,31 +750,35 @@ async def download_media_from_group(
     print(f"  {'='*45}")
 
     if not is_drive and stats["total_size"] > 0 and not check_disk_space(download_dir, stats["total_size"]):
+        if not interactive:
+            print("⏭  Grupo pulado por falta de espaço em disco.\n")
+            return 1
         try:
             cont = input("\n  Deseja continuar mesmo assim? (s/n): ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\nCancelado.")
-            return
+            return 0
         if cont != "s":
             print("⏭  Download cancelado.\n")
-            return
+            return 0
     print()
 
     if not pending:
         print(f"✅ Todos os {skipped} arquivos já foram baixados!\n")
-        return
+        return 0
 
     print(f"  📥 {len(pending)} para baixar | ⏭ {skipped} já existem\n")
 
-    try:
-        confirma = input("👉 Deseja continuar com o download? (s/n): ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print("\nCancelado.")
-        return
+    if interactive:
+        try:
+            confirma = input("👉 Deseja continuar com o download? (s/n): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            return 0
 
-    if confirma != "s":
-        print("⏭  Download cancelado.\n")
-        return
+        if confirma != "s":
+            print("⏭  Download cancelado.\n")
+            return 0
 
     if is_drive:
         print(f"\n☁️  Salvando no Google Drive\n")
@@ -681,19 +800,18 @@ async def download_media_from_group(
                 await asyncio.sleep(DOWNLOAD_DELAY)
 
             size_str = f" ({format_size(expected_size)})" if expected_size else ""
-            print(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
+            logger.info("Iniciando [%d/%d] %s%s", item_index, len(pending), file_name, size_str)
+            live.log(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
 
             if is_drive:
                 success = await download_with_retry(
                     client, group.entity, message_id, None, expected_size,
-                    show_progress=not is_parallel,
                     drive_service=drive_service, drive_folder_id=file_path_or_folder_id,
                     file_name=file_name,
                 )
             else:
                 success = await download_with_retry(
                     client, group.entity, message_id, file_path_or_folder_id, expected_size,
-                    show_progress=not is_parallel,
                 )
 
             async with counter_lock:
@@ -710,8 +828,9 @@ async def download_media_from_group(
                             "size": file_path_or_folder_id.stat().st_size,
                         }
                     download_log[group_log_key]["stats"]["completed"] = len(download_log[group_log_key]["downloaded"])
+                    logger.info("Concluído (%d/%d): %s", downloaded, len(pending), file_name)
                     if is_parallel:
-                        print(f"  ✅ {file_name} — concluído ({downloaded}/{len(pending)})")
+                        live.log(f"  ✅ {file_name} — concluído ({downloaded}/{len(pending)})")
                 else:
                     error_count += 1
                     download_log[group_log_key]["failed"][str(message_id)] = {
@@ -719,7 +838,7 @@ async def download_media_from_group(
                         "error": "falha permanente",
                     }
                     download_log[group_log_key]["stats"]["errors"] = len(download_log[group_log_key]["failed"])
-                    print(f"  💀 Falha permanente após {MAX_RETRIES} tentativas: {file_name}")
+                    live.log(f"  💀 Falha permanente após {MAX_RETRIES} tentativas: {file_name}")
 
                 if (downloaded + error_count) % 5 == 0:
                     save_download_log(download_log)
@@ -738,6 +857,10 @@ async def download_media_from_group(
     elapsed = time.time() - start_time
     elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
 
+    logger.info(
+        "Grupo '%s' finalizado: baixados=%d, pulados=%d, erros=%d, tempo=%s",
+        group.name, downloaded, skipped, error_count, elapsed_str,
+    )
     print(f"\n{'='*50}")
     print(f"✅ Baixados: {downloaded}")
     print(f"⏭  Já existiam (pulados): {skipped}")
@@ -748,9 +871,89 @@ async def download_media_from_group(
         print(f"☁️  Destino: Google Drive")
     else:
         print(f"📂 Pasta: {download_dir}")
+    return error_count
+
+
+def parse_selection(text: str, total: int) -> list[int] | None:
+    """'3' ou '1,4,7' ou '2-5,9' (base 1) -> índices base 0 sem repetição; None se inválido."""
+    result: list[int] = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            return None
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if not (a.isdigit() and b.isdigit()):
+                return None
+            nums = range(int(a), int(b) + 1)
+        elif part.isdigit():
+            nums = [int(part)]
+        else:
+            return None
+        for n in nums:
+            if n < 1 or n > total:
+                return None
+            if n - 1 not in result:
+                result.append(n - 1)
+    return result or None
+
+
+def normalizar_busca(texto: str) -> str:
+    """Minúsculas e sem acento, para busca por trecho do nome."""
+    sem_acento = unicodedata.normalize("NFD", texto)
+    return "".join(c for c in sem_acento if not unicodedata.combining(c)).casefold()
+
+
+POST_ACTIONS = {
+    "1": "Nada (só sair)",
+    "2": "Desligar a máquina",
+    "3": "Suspender",
+    "4": "Notificação desktop",
+}
+
+
+def ask_post_actions() -> set[str] | None:
+    """Pergunta o que fazer ao fim. Retorna chaves de POST_ACTIONS ('1'..'4'); None = cancelado."""
+    print("\nO que fazer quando terminar? (pode combinar, ex: 4,2)")
+    for k, v in POST_ACTIONS.items():
+        print(f"  {k}. {v}")
+    try:
+        raw = input("👉 Ação [1]: ").strip() or "1"
+    except (KeyboardInterrupt, EOFError):
+        return None
+    chosen = {c for c in raw.replace(" ", "").split(",") if c}
+    if not chosen or not chosen <= POST_ACTIONS.keys():
+        print("  (opção inválida, usando: Nada)")
+        return {"1"}
+    if "2" in chosen and "3" in chosen:
+        print("  (desligar e suspender juntos: usando só desligar)")
+        chosen.discard("3")
+    return chosen
+
+
+def run_post_actions(actions: set[str], summary: str):
+    if "4" in actions:
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", "Telegram Downloader", summary], check=False)
+        else:
+            print("  ⚠  notify-send não encontrado (apt install libnotify-bin)")
+    for key, cmd in (("2", ["systemctl", "poweroff"]), ("3", ["systemctl", "suspend"])):
+        if key not in actions:
+            continue
+        label = POST_ACTIONS[key].lower()
+        print(f"\n⚠️  Vou {label} em 60s. Ctrl+C para cancelar.")
+        try:
+            for remaining in range(60, 0, -1):
+                print(f"\r   {remaining:2d}s ", end="", flush=True)
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print(f"\n   ✋ {label.capitalize()} cancelado.")
+            return
+        print()
+        subprocess.run(cmd, check=False)
 
 
 async def main():
+    setup_logging()
     api_id, api_hash = load_credentials()
 
     client = TelegramClient(
@@ -793,36 +996,61 @@ async def main():
             print("❌ Nenhum grupo ou canal encontrado.")
             break
 
-        for i, g in enumerate(groups, 1):
-            member_count = ""
-            entity = g.entity
-            if hasattr(entity, "participants_count") and entity.participants_count:
-                member_count = f" ({entity.participants_count} membros)"
-            tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
-            print(f"  {i:3d}. [{tipo}] {g.name}{member_count}")
+        filtro = ""
+        saiu = False
+        while True:
+            termo = normalizar_busca(filtro)
+            exibidos = 0
+            for i, g in enumerate(groups, 1):
+                if termo and termo not in normalizar_busca(g.name or ""):
+                    continue
+                member_count = ""
+                entity = g.entity
+                if hasattr(entity, "participants_count") and entity.participants_count:
+                    member_count = f" ({entity.participants_count} membros)"
+                tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
+                print(f"  {i:3d}. [{tipo}] {g.name}{member_count}")
+                exibidos += 1
 
-        print(f"\n  0. Sair\n")
+            if filtro:
+                print(f"\n  🔍 Filtro \"{filtro}\": {exibidos} de {len(groups)}")
+                if not exibidos:
+                    print("  Nenhum nome contém esse trecho.")
 
-        try:
-            choice = input("👉 Escolha o número do grupo: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nSaindo...")
-            break
+            print(f"\n  0. Sair\n")
+            print("  Dica: vários de uma vez para fila, ex: 1,4,7 ou 2-5")
+            print("  Buscar por trecho do nome: /trecho   (apenas / limpa o filtro)")
 
-        if choice == "0":
-            break
+            try:
+                choice = input("👉 Escolha o(s) número(s) do grupo: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nSaindo...")
+                saiu = True
+                break
 
-        try:
-            idx = int(choice) - 1
-            if idx < 0 or idx >= len(groups):
-                print("❌ Número inválido.\n")
+            if choice.startswith("/"):
+                filtro = choice[1:].strip()
+                print()
                 continue
-        except ValueError:
-            print("❌ Digite um número válido.\n")
+            break
+
+        if saiu or choice == "0":
+            break
+
+        indices = parse_selection(choice, len(groups))
+        if indices is None:
+            print("❌ Seleção inválida. Use um número, lista (1,4,7) ou faixa (2-5).\n")
             continue
 
-        selected = groups[idx]
-        print(f"\n✅ Selecionado: {selected.name}\n")
+        queue = [groups[i] for i in indices]
+        is_queue = len(queue) > 1
+        if is_queue:
+            print(f"\n✅ Fila ({len(queue)} grupos), mesma configuração para todos:")
+            for n, g in enumerate(queue, 1):
+                print(f"   {n}. {g.name}")
+            print()
+        else:
+            print(f"\n✅ Selecionado: {queue[0].name}\n")
 
         print("Que tipo de mídia deseja baixar?\n")
         for key, val in MEDIA_FILTERS.items():
@@ -908,7 +1136,7 @@ async def main():
                     if criar != "s":
                         print("⏭  Download cancelado.\n")
                         continue
-                print(f"  📂 Arquivos serão salvos em: {base_dir / sanitize_filename(selected.name)}\n")
+                print(f"  📂 Arquivos serão salvos em: {base_dir}/<nome do grupo>\n")
 
         # Verificar se existe estrutura de curso
         course_structure = None
@@ -928,28 +1156,60 @@ async def main():
             else:
                 print("  ⏭  Downloads serão salvos em pasta única.\n")
 
-        try:
-            await download_media_from_group(
-                client, selected, media_types, limit, base_dir, course_structure,
-                drive_service, drive_root_folder_id,
-            )
-        except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error("Conexão perdida durante download: %s", e)
-            print(f"\n🔌 Conexão perdida: {e}")
-            print("   Tentando reconectar...")
+        post_actions = ask_post_actions()
+        if post_actions is None:
+            print("\nSaindo...")
+            break
+
+        if drive_service is not None:
+            destination = f"Google Drive (pasta raiz: {drive_folder_name})"
+        else:
+            destination = str(base_dir or Path.cwd() / "downloads")
+        log_selection(queue, MEDIA_FILTERS[media_choice]["label"], limit, destination, course_structure, post_actions)
+
+        failed_groups: list[str] = []
+        for pos, selected in enumerate(queue, 1):
+            if is_queue:
+                print(f"\n{'#'*50}\n  FILA [{pos}/{len(queue)}]: {selected.name}\n{'#'*50}\n")
             try:
-                await client.connect()
-                print("   ✅ Reconectado! Rode novamente para continuar de onde parou.\n")
-            except Exception as re:
-                logger.error("Falha ao reconectar: %s", re)
-                print(f"   ❌ Falha ao reconectar: {re}")
-                print("   Execute o script novamente para retomar.\n")
-        except errors.FloodWaitError as e:
-            wait_time = e.seconds + 10
-            print(f"\n⏳ Flood wait do Telegram: aguardando {wait_time}s...")
-            logger.warning("FloodWaitError no loop principal: aguardando %ds", wait_time)
-            await asyncio.sleep(wait_time)
-            print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
+                errs = await download_media_from_group(
+                    client, selected, media_types, limit, base_dir, course_structure,
+                    drive_service, drive_root_folder_id, interactive=not is_queue,
+                )
+                if errs:
+                    failed_groups.append(selected.name)
+            except (ConnectionError, TimeoutError, OSError) as e:
+                failed_groups.append(selected.name)
+                logger.error("Conexão perdida durante download: %s", e)
+                print(f"\n🔌 Conexão perdida: {e}")
+                print("   Tentando reconectar...")
+                try:
+                    await client.connect()
+                    print("   ✅ Reconectado! Rode novamente para continuar de onde parou.\n")
+                except Exception as re:
+                    logger.error("Falha ao reconectar: %s", re)
+                    print(f"   ❌ Falha ao reconectar: {re}")
+                    print("   Execute o script novamente para retomar.\n")
+            except errors.FloodWaitError as e:
+                failed_groups.append(selected.name)
+                wait_time = e.seconds + 10
+                print(f"\n⏳ Flood wait do Telegram: aguardando {wait_time}s...")
+                logger.warning("FloodWaitError no loop principal: aguardando %ds", wait_time)
+                await asyncio.sleep(wait_time)
+                print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
+
+        if is_queue:
+            print(f"\n{'='*50}\n  FILA CONCLUÍDA: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha")
+            for name in failed_groups:
+                print(f"  ❌ com falha: {name}")
+            print(f"{'='*50}")
+
+        if post_actions != {"1"}:
+            await client.disconnect()
+            summary = f"Download concluído: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha"
+            run_post_actions(post_actions, summary)
+            print("\n👋 Até mais!")
+            return
 
         print()
         try:
