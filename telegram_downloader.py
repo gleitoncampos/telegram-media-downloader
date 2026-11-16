@@ -183,7 +183,7 @@ def check_cryptg():
         return False
 
 
-def get_file_name(message) -> str | None:
+def _default_file_name(message) -> str | None:
     if not message.media:
         return None
 
@@ -216,6 +216,24 @@ def get_file_name(message) -> str | None:
         return sanitize_filename(f"arquivo_{message.id}.{ext}")
 
     return None
+
+
+def get_file_name(message) -> str | None:
+    default = _default_file_name(message)
+    if default is None or isinstance(message.media, MessageMediaPhoto):
+        return default
+
+    caption = next(
+        (ln.strip() for ln in (message.message or "").splitlines() if ln.strip()), ""
+    )
+    if not caption:
+        return default
+
+    tail = f"_msg{message.id}{Path(default).suffix}"
+    stem = sanitize_filename(caption)
+    while len((stem + tail).encode("utf-8")) > 255:
+        stem = stem[:-1]
+    return sanitize_filename(stem + tail)
 
 
 def classify_media(message) -> str | None:
