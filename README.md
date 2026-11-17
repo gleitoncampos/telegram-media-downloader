@@ -88,13 +88,10 @@ Tudo é salvo localmente — **nas próximas vezes, é só rodar `./run.sh`**.
 
 🔄 Carregando seus grupos/canais...
 
-    1. [Canal] Curso de Python (5420 membros)
-    2. [Grupo] Família
-    3. [Canal] Tech News (12000 membros)
-
-    0. Sair
-
-👉 Escolha o número do grupo: 1
+? Escolha o(s) grupo(s): (setas navegam, ESPAÇO marca, ENTER confirma; digite para filtrar pelo nome)
+ » ● [Canal] Curso de Python (5420 membros)
+   ○ [Grupo] Família
+   ○ [Canal] Tech News (12000 membros)
 
 Que tipo de mídia deseja baixar?
 

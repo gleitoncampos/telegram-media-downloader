@@ -17,6 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import questionary
 from telethon import TelegramClient, errors
 from telethon.tl.types import (
     Channel,
@@ -892,33 +893,47 @@ async def download_media_from_group(
     return error_count
 
 
-def parse_selection(text: str, total: int) -> list[int] | None:
-    """'3' ou '1,4,7' ou '2-5,9' (base 1) -> índices base 0 sem repetição; None se inválido."""
-    result: list[int] = []
-    for part in text.replace(" ", "").split(","):
-        if not part:
-            return None
-        if "-" in part:
-            a, _, b = part.partition("-")
-            if not (a.isdigit() and b.isdigit()):
-                return None
-            nums = range(int(a), int(b) + 1)
-        elif part.isdigit():
-            nums = [int(part)]
-        else:
-            return None
-        for n in nums:
-            if n < 1 or n > total:
-                return None
-            if n - 1 not in result:
-                result.append(n - 1)
-    return result or None
-
-
 def normalizar_busca(texto: str) -> str:
     """Minúsculas e sem acento, para busca por trecho do nome."""
     sem_acento = unicodedata.normalize("NFD", texto)
     return "".join(c for c in sem_acento if not unicodedata.combining(c)).casefold()
+
+
+class _TituloBusca(str):
+    """Título exibido no checkbox. O filtro do questionary compara com título.lower();
+    aqui .lower() devolve só o nome, sem acento, para a busca casar por trecho do nome."""
+
+    def lower(self):
+        return self.busca
+
+
+def montar_opcoes(groups) -> list:
+    """Uma opção por grupo: '[Canal|Grupo] Nome (N membros)', valor = índice na lista."""
+    opcoes = []
+    for i, g in enumerate(groups):
+        member_count = ""
+        entity = g.entity
+        if hasattr(entity, "participants_count") and entity.participants_count:
+            member_count = f" ({entity.participants_count} membros)"
+        tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
+        titulo = _TituloBusca(f"[{tipo}] {g.name}{member_count}")
+        titulo.busca = normalizar_busca(g.name or "")
+        opcoes.append(questionary.Choice(title=titulo, value=i))
+    return opcoes
+
+
+async def escolher_grupos(groups) -> list | None:
+    """Caixa de seleção dos grupos. Retorna os marcados na ordem da lista; None = sair."""
+    marcados = await questionary.checkbox(
+        "Escolha o(s) grupo(s):",
+        choices=montar_opcoes(groups),
+        instruction="(setas navegam, ESPAÇO marca, ENTER confirma; digite para filtrar pelo nome)",
+        use_search_filter=True,
+        use_jk_keys=False,
+    ).ask_async(kbi_msg="\nSaindo...")
+    if not marcados:
+        return None
+    return [groups[i] for i in sorted(marcados)]
 
 
 POST_ACTIONS = {
@@ -1014,53 +1029,10 @@ async def main():
             print("❌ Nenhum grupo ou canal encontrado.")
             break
 
-        filtro = ""
-        saiu = False
-        while True:
-            termo = normalizar_busca(filtro)
-            exibidos = 0
-            for i, g in enumerate(groups, 1):
-                if termo and termo not in normalizar_busca(g.name or ""):
-                    continue
-                member_count = ""
-                entity = g.entity
-                if hasattr(entity, "participants_count") and entity.participants_count:
-                    member_count = f" ({entity.participants_count} membros)"
-                tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
-                print(f"  {i:3d}. [{tipo}] {g.name}{member_count}")
-                exibidos += 1
-
-            if filtro:
-                print(f"\n  🔍 Filtro \"{filtro}\": {exibidos} de {len(groups)}")
-                if not exibidos:
-                    print("  Nenhum nome contém esse trecho.")
-
-            print(f"\n  0. Sair\n")
-            print("  Dica: vários de uma vez para fila, ex: 1,4,7 ou 2-5")
-            print("  Buscar por trecho do nome: /trecho   (apenas / limpa o filtro)")
-
-            try:
-                choice = input("👉 Escolha o(s) número(s) do grupo: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nSaindo...")
-                saiu = True
-                break
-
-            if choice.startswith("/"):
-                filtro = choice[1:].strip()
-                print()
-                continue
+        queue = await escolher_grupos(groups)
+        if not queue:
             break
 
-        if saiu or choice == "0":
-            break
-
-        indices = parse_selection(choice, len(groups))
-        if indices is None:
-            print("❌ Seleção inválida. Use um número, lista (1,4,7) ou faixa (2-5).\n")
-            continue
-
-        queue = [groups[i] for i in indices]
         is_queue = len(queue) > 1
         if is_queue:
             print(f"\n✅ Fila ({len(queue)} grupos), mesma configuração para todos:")
