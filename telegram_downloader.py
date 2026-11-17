@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import questionary
+from prompt_toolkit.keys import Keys
 from telethon import TelegramClient, errors
 from telethon.tl.types import (
     Channel,
@@ -922,16 +923,29 @@ def montar_opcoes(groups) -> list:
     return opcoes
 
 
+def _marcar_com_seta_direita(pergunta):
+    """No questionary o ESPAÇO marca e o filtro ignora espaço, o que impede buscar
+    "curso de python". Move o toggle do ESPAÇO para a seta → e faz o ESPAÇO digitar
+    no filtro, reaproveitando os handlers do próprio checkbox (ligado a questionary <2.2)."""
+    bindings = pergunta.application.key_bindings
+    handler = {b.keys: b.handler for b in bindings.bindings}
+    marcar, digitar = handler[(" ",)], handler[("a",)]
+    bindings.remove(" ")
+    bindings.add(" ", eager=True)(digitar)
+    bindings.add(Keys.Right, eager=True)(marcar)
+    return pergunta
+
+
 async def escolher_grupos(groups) -> list | None:
     """Caixa de seleção dos grupos. Retorna os marcados na ordem da lista; None = sair."""
     try:
-        marcados = await questionary.checkbox(
+        marcados = await _marcar_com_seta_direita(questionary.checkbox(
             "Escolha o(s) grupo(s):",
             choices=montar_opcoes(groups),
-            instruction="(setas navegam, ESPAÇO marca, ENTER confirma; digite para filtrar pelo nome)",
+            instruction="(setas navegam, → marca, ENTER confirma; digite para filtrar pelo nome)",
             use_search_filter=True,
             use_jk_keys=False,
-        ).ask_async(kbi_msg="\nSaindo...")
+        )).ask_async(kbi_msg="\nSaindo...")
     except EOFError:
         print("\nSaindo...")
         return None
