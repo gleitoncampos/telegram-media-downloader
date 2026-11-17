@@ -958,6 +958,7 @@ def normalizar_busca(texto: str) -> str:
 
 
 COR_STATUS = {"completo": "fg:ansigreen", "parcial": "fg:ansiyellow", "nada": ""}
+ORDEM_STATUS = {"parcial": 0, "completo": 1, "nada": 2}
 
 
 class _TituloBusca(list):
@@ -973,13 +974,17 @@ def montar_opcoes(groups, download_log: dict | None = None) -> list:
     O nome fica verde (baixado por completo), amarelo (baixado em parte) ou sem cor (nada baixado)."""
     download_log = download_log or {}
     opcoes = []
-    for i, g in enumerate(groups):
+    status = [status_grupo(download_log.get(sanitize_filename(g.name or ""))) for g in groups]
+    # amarelo, depois verde, depois sem cor; ordem original dentro de cada bloco
+    ordem = sorted(range(len(groups)), key=lambda i: ORDEM_STATUS[status[i]])
+    for i in ordem:
+        g = groups[i]
         member_count = ""
         entity = g.entity
         if hasattr(entity, "participants_count") and entity.participants_count:
             member_count = f" ({entity.participants_count} membros)"
         tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
-        cor = COR_STATUS[status_grupo(download_log.get(sanitize_filename(g.name or "")))]
+        cor = COR_STATUS[status[i]]
         titulo = _TituloBusca([(cor, f"[{tipo}] {g.name}{member_count}")])
         titulo.busca = normalizar_busca(g.name or "")
         opcoes.append(questionary.Choice(title=titulo, value=i))
@@ -999,16 +1004,33 @@ def _marcar_com_seta_direita(pergunta):
     return pergunta
 
 
+def _atalhos_de_pagina(pergunta):
+    """PageUp/PageDown saltam uma tela; Home/End vão ao primeiro/último item da lista filtrada."""
+    bindings = pergunta.application.key_bindings
+    ic = next(w.content for w in pergunta.application.layout.find_all_windows()
+              if type(w.content).__name__ == "InquirerControl")
+
+    def ir_para(destino):
+        ic.pointed_at = max(0, min(len(ic.filtered_choices) - 1, destino))
+
+    pagina = lambda: max(1, shutil.get_terminal_size().lines - 6)
+    bindings.add(Keys.PageDown, eager=True)(lambda e: ir_para(ic.pointed_at + pagina()))
+    bindings.add(Keys.PageUp, eager=True)(lambda e: ir_para(ic.pointed_at - pagina()))
+    bindings.add(Keys.Home, eager=True)(lambda e: ir_para(0))
+    bindings.add(Keys.End, eager=True)(lambda e: ir_para(len(ic.filtered_choices) - 1))
+    return pergunta
+
+
 async def escolher_grupos(groups, download_log: dict | None = None) -> list | None:
     """Caixa de seleção dos grupos. Retorna os marcados na ordem da lista; None = sair."""
     try:
-        marcados = await _marcar_com_seta_direita(questionary.checkbox(
+        marcados = await _atalhos_de_pagina(_marcar_com_seta_direita(questionary.checkbox(
             "Escolha o(s) grupo(s):",
             choices=montar_opcoes(groups, download_log),
-            instruction="(setas navegam, → marca, ENTER confirma; digite para filtrar pelo nome; verde = completo, amarelo = parcial)",
+            instruction="(setas, PgUp/PgDn, Home/End navegam; → marca; ENTER confirma; digite para filtrar; amarelo = parcial, verde = completo)",
             use_search_filter=True,
             use_jk_keys=False,
-        )).ask_async(kbi_msg="\nSaindo...")
+        ))).ask_async(kbi_msg="\nSaindo...")
     except EOFError:
         print("\nSaindo...")
         return None
