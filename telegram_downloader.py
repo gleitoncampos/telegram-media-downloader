@@ -924,13 +924,17 @@ def montar_opcoes(groups) -> list:
 
 async def escolher_grupos(groups) -> list | None:
     """Caixa de seleção dos grupos. Retorna os marcados na ordem da lista; None = sair."""
-    marcados = await questionary.checkbox(
-        "Escolha o(s) grupo(s):",
-        choices=montar_opcoes(groups),
-        instruction="(setas navegam, ESPAÇO marca, ENTER confirma; digite para filtrar pelo nome)",
-        use_search_filter=True,
-        use_jk_keys=False,
-    ).ask_async(kbi_msg="\nSaindo...")
+    try:
+        marcados = await questionary.checkbox(
+            "Escolha o(s) grupo(s):",
+            choices=montar_opcoes(groups),
+            instruction="(setas navegam, ESPAÇO marca, ENTER confirma; digite para filtrar pelo nome)",
+            use_search_filter=True,
+            use_jk_keys=False,
+        ).ask_async(kbi_msg="\nSaindo...")
+    except EOFError:
+        print("\nSaindo...")
+        return None
     if not marcados:
         return None
     return [groups[i] for i in sorted(marcados)]
