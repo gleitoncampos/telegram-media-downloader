@@ -391,6 +391,60 @@ def save_download_log(log: dict):
         logger.warning("Falha ao salvar log de download: %s", e)
 
 
+def registrar_scan(entrada: dict, total: int, pendentes: int):
+    """Guarda no log do grupo o resultado do último scan (usado para colorir o menu)."""
+    entrada["scan"] = {"total": total, "pendentes": pendentes, "em": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def status_grupo(entrada: dict | None) -> str:
+    """'completo' (verde), 'parcial' (amarelo) ou 'nada' (sem cor), pelo log e pelo último scan."""
+    if not entrada or not entrada.get("downloaded"):
+        return "nada"
+    falhas = [k for k in entrada.get("failed", {}) if k not in entrada["downloaded"]]
+    scan = entrada.get("scan")
+    if scan and scan.get("pendentes") == 0 and not falhas:
+        return "completo"
+    return "parcial"
+
+
+async def contar_grupo(client: TelegramClient, group, entrada: dict) -> tuple[int, int]:
+    """Só leitura: (total de mídias do grupo, quantas ainda não estão no log). Não toca no disco."""
+    baixados = entrada.get("downloaded", {})
+    total = pendentes = 0
+    async for message in client.iter_messages(group.entity):
+        if classify_media(message) is None or get_file_name(message) is None:
+            continue
+        total += 1
+        if str(message.id) not in baixados:
+            pendentes += 1
+    return total, pendentes
+
+
+async def completar_scans_legados(client: TelegramClient, groups, download_log: dict):
+    """Grupos baixados antes do campo 'scan' existir: conta uma vez para o menu pintá-los certo."""
+    faltam = [
+        g for g in groups
+        if download_log.get(sanitize_filename(g.name), {}).get("downloaded")
+        and "scan" not in download_log[sanitize_filename(g.name)]
+    ]
+    if not faltam:
+        return
+    print(f"🎨 Contando mídias de {len(faltam)} grupo(s) já baixados para colorir o menu (só nesta vez)...")
+    for n, g in enumerate(faltam, 1):
+        entrada = download_log[sanitize_filename(g.name)]
+        print(f"   [{n}/{len(faltam)}] {g.name}...", end="", flush=True)
+        try:
+            total, pendentes = await contar_grupo(client, g, entrada)
+        except Exception as e:
+            logger.warning("Falha ao contar mídias de '%s': %s", g.name, e)
+            print(" falhou, fica amarelo.")
+            continue
+        registrar_scan(entrada, total, pendentes)
+        save_download_log(download_log)
+        print(f" {total} mídias, {pendentes} pendentes.")
+    print()
+
+
 
 def check_disk_space(path: Path, required_bytes: int) -> bool:
     free = shutil.disk_usage(path).free
@@ -742,6 +796,8 @@ async def download_media_from_group(
         return 1
 
     total_items = sum(stats["counts"].values())
+    registrar_scan(download_log[group_log_key], total_items, len(pending))
+    save_download_log(download_log)
     logger.info(
         "Grupo '%s': %d vídeos, %d fotos, %d documentos (~%s) | %d para baixar, %d já existiam",
         group.name, stats["counts"]["video"], stats["counts"]["photo"], stats["counts"]["document"],
@@ -873,6 +929,7 @@ async def download_media_from_group(
             if isinstance(r, Exception):
                 logger.error("Exceção não tratada em task de download: %s", r)
     finally:
+        registrar_scan(download_log[group_log_key], total_items, len(pending) - downloaded)
         save_download_log(download_log)
     elapsed = time.time() - start_time
     elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
@@ -900,16 +957,21 @@ def normalizar_busca(texto: str) -> str:
     return "".join(c for c in sem_acento if not unicodedata.combining(c)).casefold()
 
 
-class _TituloBusca(str):
-    """Título exibido no checkbox. O filtro do questionary compara com título.lower();
-    aqui .lower() devolve só o nome, sem acento, para a busca casar por trecho do nome."""
+COR_STATUS = {"completo": "fg:ansigreen", "parcial": "fg:ansiyellow", "nada": ""}
+
+
+class _TituloBusca(list):
+    """Título colorido do checkbox (lista de (estilo, texto)). O filtro do questionary compara
+    com título.lower(); aqui .lower() devolve só o nome, sem acento, para a busca casar por trecho."""
 
     def lower(self):
         return self.busca
 
 
-def montar_opcoes(groups) -> list:
-    """Uma opção por grupo: '[Canal|Grupo] Nome (N membros)', valor = índice na lista."""
+def montar_opcoes(groups, download_log: dict | None = None) -> list:
+    """Uma opção por grupo: '[Canal|Grupo] Nome (N membros)', valor = índice na lista.
+    O nome fica verde (baixado por completo), amarelo (baixado em parte) ou sem cor (nada baixado)."""
+    download_log = download_log or {}
     opcoes = []
     for i, g in enumerate(groups):
         member_count = ""
@@ -917,7 +979,8 @@ def montar_opcoes(groups) -> list:
         if hasattr(entity, "participants_count") and entity.participants_count:
             member_count = f" ({entity.participants_count} membros)"
         tipo = "Canal" if isinstance(entity, Channel) and entity.broadcast else "Grupo"
-        titulo = _TituloBusca(f"[{tipo}] {g.name}{member_count}")
+        cor = COR_STATUS[status_grupo(download_log.get(sanitize_filename(g.name or "")))]
+        titulo = _TituloBusca([(cor, f"[{tipo}] {g.name}{member_count}")])
         titulo.busca = normalizar_busca(g.name or "")
         opcoes.append(questionary.Choice(title=titulo, value=i))
     return opcoes
@@ -936,13 +999,13 @@ def _marcar_com_seta_direita(pergunta):
     return pergunta
 
 
-async def escolher_grupos(groups) -> list | None:
+async def escolher_grupos(groups, download_log: dict | None = None) -> list | None:
     """Caixa de seleção dos grupos. Retorna os marcados na ordem da lista; None = sair."""
     try:
         marcados = await _marcar_com_seta_direita(questionary.checkbox(
             "Escolha o(s) grupo(s):",
-            choices=montar_opcoes(groups),
-            instruction="(setas navegam, → marca, ENTER confirma; digite para filtrar pelo nome)",
+            choices=montar_opcoes(groups, download_log),
+            instruction="(setas navegam, → marca, ENTER confirma; digite para filtrar pelo nome; verde = completo, amarelo = parcial)",
             use_search_filter=True,
             use_jk_keys=False,
         )).ask_async(kbi_msg="\nSaindo...")
@@ -1047,7 +1110,9 @@ async def main():
             print("❌ Nenhum grupo ou canal encontrado.")
             break
 
-        queue = await escolher_grupos(groups)
+        download_log = load_download_log()
+        await completar_scans_legados(client, groups, download_log)
+        queue = await escolher_grupos(groups, download_log)
         if not queue:
             break
 
