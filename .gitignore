@@ -10,3 +10,4 @@ downloader.log
 logs/
 drive_token.json
 drive_credentials.json
+ultimos_destinos.json

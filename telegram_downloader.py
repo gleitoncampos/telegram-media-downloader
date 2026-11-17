@@ -1017,6 +1017,64 @@ async def escolher_grupos(groups, download_log: dict | None = None) -> list | No
     return [groups[i] for i in sorted(marcados)]
 
 
+DESTINOS_FILE = Path(__file__).parent / "ultimos_destinos.json"
+MAX_DESTINOS = 10
+_NOVO_DESTINO = object()
+
+
+def carregar_destinos() -> list[str]:
+    """Últimas pastas de destino usadas, a mais recente primeiro."""
+    try:
+        dados = json.loads(DESTINOS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(dados, list):
+        return []
+    return [d for d in dados if isinstance(d, str)][:MAX_DESTINOS]
+
+
+def salvar_destino(destino: str):
+    """Põe a pasta no topo da lista de últimos destinos (sem repetir)."""
+    lista = [destino] + [d for d in carregar_destinos() if d != destino]
+    try:
+        tmp = DESTINOS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(lista[:MAX_DESTINOS], indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp), str(DESTINOS_FILE))
+    except OSError as e:
+        logger.warning("Falha ao salvar últimos destinos: %s", e)
+
+
+async def pedir_destino() -> str | None:
+    """Pasta de destino: escolhe um dos últimos (setas) ou digita outro. '' = padrão; None = sair."""
+    recentes = carregar_destinos()
+    if recentes:
+        try:
+            escolha = await questionary.select(
+                "Pasta de destino:",
+                choices=[
+                    *recentes,
+                    questionary.Choice("✏  Digitar outro caminho", value=_NOVO_DESTINO),
+                    questionary.Choice("📂 Padrão (./downloads)", value=""),
+                ],
+                use_jk_keys=False,
+            ).ask_async(kbi_msg="\nSaindo...")
+        except EOFError:
+            escolha = None
+        if escolha is None:
+            print("\nSaindo...")
+            return None
+        if escolha is not _NOVO_DESTINO:
+            return escolha
+    print("Onde deseja salvar os arquivos?")
+    print("  - Digite o caminho completo da pasta (ex: /home/usuario/cursos)")
+    print("  - Ou pressione ENTER para usar o padrão (./downloads)\n")
+    try:
+        return input("👉 Pasta de destino: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nSaindo...")
+        return None
+
+
 POST_ACTIONS = {
     "1": "Nada (só sair)",
     "2": "Desligar a máquina",
@@ -1188,14 +1246,8 @@ async def main():
 
         base_dir = None
         if drive_service is None:
-            print(f"Onde deseja salvar os arquivos?")
-            print(f"  - Digite o caminho completo da pasta (ex: /home/usuario/cursos)")
-            print(f"  - Ou pressione ENTER para usar o padrão (./downloads)\n")
-
-            try:
-                dir_input = input("👉 Pasta de destino: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nSaindo...")
+            dir_input = await pedir_destino()
+            if dir_input is None:
                 break
 
             if dir_input:
@@ -1209,6 +1261,7 @@ async def main():
                     if criar != "s":
                         print("⏭  Download cancelado.\n")
                         continue
+                salvar_destino(str(base_dir))
                 print(f"  📂 Arquivos serão salvos em: {base_dir}/<nome do grupo>\n")
 
         # Verificar se existe estrutura de curso
