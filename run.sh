@@ -33,4 +33,4 @@ if [ ! -d "$VENV_DIR" ]; then
     echo ""
 fi
 
-"$VENV_DIR/bin/python" telegram_downloader.py
+"$VENV_DIR/bin/python" telegram_downloader.py "$@"

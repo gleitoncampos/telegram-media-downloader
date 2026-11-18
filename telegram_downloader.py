@@ -4,6 +4,7 @@ Telegram Group Downloader
 Baixa vídeos e arquivos de grupos do Telegram via API (MTProto).
 """
 
+import argparse
 import atexit
 import os
 import re
@@ -1279,7 +1280,72 @@ async def executar_fila(client, queue: list, media_types: list[str], limit: int 
     return failed_groups
 
 
-async def main():
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Telegram Group Downloader")
+    parser.add_argument("--resume", action="store_true",
+                        help="retoma, sem perguntar nada, os grupos que não terminaram no último lote")
+    return parser.parse_args(argv)
+
+
+async def retomar(client) -> int:
+    """Retoma o último lote com as mesmas escolhas. Códigos: 0 ok/nada a retomar, 1 ausente ou falha, 2 não dá para retomar."""
+    lote = carregar_lote()
+    if lote is None:
+        print("❌ Nenhum lote anterior para retomar (ultimo_lote.json ausente ou inválido).")
+        return 2
+
+    erro = validar_retomada(lote)
+    if erro:
+        print(f"❌ {erro}")
+        return 2
+
+    print("🔄 Carregando seus grupos/canais...\n")
+    groups = await list_groups(client)
+    encontrados, ausentes = resolver_grupos(lote, groups)
+    salvar_lote(lote)
+
+    if not encontrados and not ausentes:
+        print("✅ Tudo concluído no último lote.")
+        return 0
+
+    base_dir = Path(lote["destino"]).expanduser().resolve() if lote["destino"] else None
+    course_structure = load_course_structure() if lote["estrutura"] else None
+    limit = lote["limite"]
+    acoes = set(lote["acoes"])
+
+    print(f"♻️  Retomando o lote iniciado em {lote['iniciado_em']}")
+    print(f"   Mídia: {MEDIA_FILTERS[lote['midia']]['label']}")
+    print(f"   Limite: {limit if limit else 'todas'}")
+    print(f"   Destino: {base_dir or Path.cwd() / 'downloads'}")
+    print(f"   Grupos a retomar ({len(encontrados)}):")
+    for n, g in enumerate(encontrados, 1):
+        print(f"     {n}. {g.name}")
+    for nome in ausentes:
+        print(f"   ⚠  Grupo não encontrado, será pulado: {nome}")
+    print()
+
+    failed_groups: list[str] = []
+    if encontrados:
+        failed_groups = await executar_fila(
+            client, encontrados, MEDIA_FILTERS[lote["midia"]]["types"], limit, base_dir,
+            course_structure, None, None, interativo=False, lote=lote,
+        )
+        print(f"\n{'='*50}\n  RETOMADA CONCLUÍDA: {len(encontrados) - len(failed_groups)}/{len(encontrados)} grupos sem falha")
+        for name in failed_groups:
+            print(f"  ❌ com falha: {name}")
+        print(f"{'='*50}")
+
+    if acoes != {"1"}:
+        await client.disconnect()
+        summary = f"Retomada concluída: {len(encontrados) - len(failed_groups)}/{len(encontrados)} grupos sem falha"
+        run_post_actions(acoes, summary)
+
+    return 1 if ausentes or failed_groups else 0
+
+
+async def main(argv: list[str] | None = None) -> int | None:
+    args = parse_args(argv)
+
     setup_logging()
     api_id, api_hash = load_credentials()
 
@@ -1314,6 +1380,12 @@ async def main():
     me = await client.get_me()
     print(f"  Logado como: {me.first_name} (@{me.username or 'sem username'})")
     print(f"{'='*50}\n")
+
+    if args.resume:
+        try:
+            return await retomar(client)
+        finally:
+            await client.disconnect()
 
     while True:
         print("🔄 Carregando seus grupos/canais...\n")
@@ -1487,6 +1559,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        codigo = asyncio.run(main())
+        sys.exit(codigo or 0)
     except KeyboardInterrupt:
         print("\n\n👋 Download interrompido. Execute novamente para continuar de onde parou.")
