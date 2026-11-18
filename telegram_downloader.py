@@ -1140,6 +1140,17 @@ def resolver_grupos(lote: dict, groups: list) -> tuple[list, list[str]]:
     return encontrados, ausentes
 
 
+def validar_retomada(lote: dict) -> str | None:
+    """Mensagem de erro se o lote não pode ser retomado agora; None se pode seguir. Não cria nada em disco."""
+    if lote["drive"]:
+        return "O lote foi gravado com destino Google Drive, e o Drive não é retomado automaticamente."
+    if lote["destino"] is not None and not Path(lote["destino"]).expanduser().exists():
+        return f"A pasta de destino do lote não existe: {lote['destino']} (disco/SMB desmontado?)"
+    if lote["estrutura"] and load_course_structure() is None:
+        return "O lote usava organização por pastas, mas o course_structure.json não foi encontrado."
+    return None
+
+
 async def pedir_destino() -> str | None:
     """Pasta de destino: escolhe um dos últimos (setas) ou digita outro. '' = padrão; None = sair."""
     recentes = carregar_destinos()
