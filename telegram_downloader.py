@@ -813,7 +813,7 @@ async def download_media_from_group(
     client: TelegramClient, group, media_types: list[str], limit: int | None,
     base_dir: Path | None = None, course_structure: dict | None = None,
     drive_service=None, drive_root_folder_id: str | None = None,
-    interactive: bool = True,
+    interactive: bool = True, monitor: MonitorVazao | None = None,
 ) -> int:
     """Baixa a mídia de um grupo. Retorna o número de falhas (0 = tudo certo).
 
@@ -928,6 +928,17 @@ async def download_media_from_group(
         nonlocal downloaded, error_count
 
         async with semaphore:
+            if monitor is not None and monitor.lento():
+                if not monitor.avisado:
+                    monitor.avisado = True
+                    aviso = (
+                        f"⏸  Rate limit detectado (vazão {monitor.vazao_bps / 1024 / 1024:.2f} MB/s "
+                        "na janela de 10 min): não inicio novos downloads"
+                    )
+                    logger.warning(aviso)
+                    live.log(aviso)
+                return
+
             if is_parallel:
                 await asyncio.sleep(DOWNLOAD_DELAY)
 
