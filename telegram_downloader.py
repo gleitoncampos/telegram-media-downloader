@@ -324,6 +324,7 @@ class LiveProgress:
         self._drawn_lines = 0
         self._last_draw = 0.0
         self.enabled = sys.stdout.isatty()
+        self.monitor = None
 
     def start(self, name: str):
         self._next_id += 1
@@ -331,7 +332,7 @@ class LiveProgress:
         now = time.time()
         self.active[task_id] = {
             "name": name, "current": 0, "total": 0,
-            "last_time": now, "last_bytes": 0, "speed": 0.0,
+            "last_time": now, "last_bytes": 0, "speed": 0.0, "reportado": 0,
         }
         self._draw(force=True)
 
@@ -352,6 +353,9 @@ class LiveProgress:
 
     def _update(self, task_id: int, current: int, total: int):
         task = self.active.get(task_id)
+        if self.monitor and task:
+            self.monitor.registrar(current - task["reportado"], len(self.active))
+            task["reportado"] = current
         if task is None or total <= 0:
             return
         now = time.time()
