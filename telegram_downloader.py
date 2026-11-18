@@ -1231,6 +1231,54 @@ def run_post_actions(actions: set[str], summary: str):
         subprocess.run(cmd, check=False)
 
 
+async def executar_fila(client, queue: list, media_types: list[str], limit: int | None,
+                        base_dir: Path | None, course_structure: dict | None,
+                        drive_service, drive_root_folder_id, interativo: bool,
+                        lote: dict | None = None) -> list[str]:
+    """Baixa cada grupo da fila em ordem; devolve os nomes dos que falharam. Com lote, registra o estado de cada grupo."""
+    failed_groups: list[str] = []
+    for pos, selected in enumerate(queue, 1):
+        if not interativo:
+            print(f"\n{'#'*50}\n  FILA [{pos}/{len(queue)}]: {selected.name}\n{'#'*50}\n")
+        errs = None
+        if lote is not None:
+            marcar_estado(lote, selected.id, "em_andamento")
+        try:
+            errs = await download_media_from_group(
+                client, selected, media_types, limit, base_dir, course_structure,
+                drive_service, drive_root_folder_id, interactive=interativo,
+            )
+            if errs:
+                failed_groups.append(selected.name)
+        except (ConnectionError, TimeoutError, OSError) as e:
+            failed_groups.append(selected.name)
+            logger.error("Conexão perdida durante download: %s", e)
+            print(f"\n🔌 Conexão perdida: {e}")
+            print("   Tentando reconectar...")
+            try:
+                await client.connect()
+                print("   ✅ Reconectado! Rode novamente para continuar de onde parou.\n")
+            except Exception as re:
+                logger.error("Falha ao reconectar: %s", re)
+                print(f"   ❌ Falha ao reconectar: {re}")
+                print("   Execute o script novamente para retomar.\n")
+        except errors.FloodWaitError as e:
+            failed_groups.append(selected.name)
+            wait_time = e.seconds + 10
+            print(f"\n⏳ Flood wait do Telegram: aguardando {wait_time}s...")
+            logger.warning("FloodWaitError no loop principal: aguardando %ds", wait_time)
+            await asyncio.sleep(wait_time)
+            print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
+        finally:
+            if lote is not None:
+                marcar_estado(
+                    lote, selected.id,
+                    estado_final(errs, load_download_log().get(sanitize_filename(selected.name))),
+                )
+
+    return failed_groups
+
+
 async def main():
     setup_logging()
     api_id, api_hash = load_credentials()
@@ -1400,36 +1448,16 @@ async def main():
             destination = str(base_dir or Path.cwd() / "downloads")
         log_selection(queue, MEDIA_FILTERS[media_choice]["label"], limit, destination, course_structure, post_actions)
 
-        failed_groups: list[str] = []
-        for pos, selected in enumerate(queue, 1):
-            if is_queue:
-                print(f"\n{'#'*50}\n  FILA [{pos}/{len(queue)}]: {selected.name}\n{'#'*50}\n")
-            try:
-                errs = await download_media_from_group(
-                    client, selected, media_types, limit, base_dir, course_structure,
-                    drive_service, drive_root_folder_id, interactive=not is_queue,
-                )
-                if errs:
-                    failed_groups.append(selected.name)
-            except (ConnectionError, TimeoutError, OSError) as e:
-                failed_groups.append(selected.name)
-                logger.error("Conexão perdida durante download: %s", e)
-                print(f"\n🔌 Conexão perdida: {e}")
-                print("   Tentando reconectar...")
-                try:
-                    await client.connect()
-                    print("   ✅ Reconectado! Rode novamente para continuar de onde parou.\n")
-                except Exception as re:
-                    logger.error("Falha ao reconectar: %s", re)
-                    print(f"   ❌ Falha ao reconectar: {re}")
-                    print("   Execute o script novamente para retomar.\n")
-            except errors.FloodWaitError as e:
-                failed_groups.append(selected.name)
-                wait_time = e.seconds + 10
-                print(f"\n⏳ Flood wait do Telegram: aguardando {wait_time}s...")
-                logger.warning("FloodWaitError no loop principal: aguardando %ds", wait_time)
-                await asyncio.sleep(wait_time)
-                print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
+        lote = novo_lote(
+            media_choice, limit, str(base_dir) if base_dir else None, course_structure is not None,
+            post_actions, queue, drive=drive_service is not None,
+        )
+        salvar_lote(lote)
+
+        failed_groups = await executar_fila(
+            client, queue, media_types, limit, base_dir, course_structure,
+            drive_service, drive_root_folder_id, interativo=not is_queue, lote=lote,
+        )
 
         if is_queue:
             print(f"\n{'='*50}\n  FILA CONCLUÍDA: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha")
