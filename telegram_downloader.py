@@ -1041,6 +1041,7 @@ async def escolher_grupos(groups, download_log: dict | None = None) -> list | No
 
 DESTINOS_FILE = Path(__file__).parent / "ultimos_destinos.json"
 MAX_DESTINOS = 10
+LOTE_FILE = Path(__file__).parent / "ultimo_lote.json"
 _NOVO_DESTINO = object()
 
 
@@ -1064,6 +1065,57 @@ def salvar_destino(destino: str):
         os.replace(str(tmp), str(DESTINOS_FILE))
     except OSError as e:
         logger.warning("Falha ao salvar últimos destinos: %s", e)
+
+
+def novo_lote(media_choice: str, limit: int | None, destino: str | None, estrutura: bool,
+              acoes: set[str], queue, drive: bool = False) -> dict:
+    """Escolhas do lote e estado de cada grupo, para o --resume."""
+    return {
+        "iniciado_em": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "midia": media_choice,
+        "limite": limit,
+        "destino": destino,
+        "estrutura": estrutura,
+        "acoes": sorted(acoes),
+        "drive": drive,
+        "grupos": [{"id": g.id, "nome": g.name, "estado": "pendente"} for g in queue],
+    }
+
+
+def salvar_lote(lote: dict):
+    try:
+        tmp = LOTE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(lote, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp), str(LOTE_FILE))
+    except OSError as e:
+        logger.warning("Falha ao salvar o último lote: %s", e)
+
+
+def carregar_lote() -> dict | None:
+    """Último lote gravado; None se ausente, ilegível ou sem as chaves esperadas."""
+    try:
+        lote = json.loads(LOTE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    chaves = ("midia", "limite", "destino", "estrutura", "acoes", "drive", "grupos")
+    if not isinstance(lote, dict) or not all(c in lote for c in chaves):
+        return None
+    return lote
+
+
+def marcar_estado(lote: dict, group_id: int, estado: str):
+    for item in lote["grupos"]:
+        if item["id"] == group_id:
+            item["estado"] = estado
+    salvar_lote(lote)
+
+
+def estado_final(errs: int | None, entrada_log: dict | None) -> str:
+    """'concluido' só se a chamada voltou sem exceção, sem falhas e o último scan não deixou pendentes."""
+    scan = (entrada_log or {}).get("scan")
+    if errs == 0 and scan and scan.get("pendentes") == 0:
+        return "concluido"
+    return "interrompido"
 
 
 async def pedir_destino() -> str | None:
