@@ -174,6 +174,13 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def calcular_rate(size: int, segundos: float) -> int:
+    """Taxa média em bytes/s; 0 se o tamanho ou a duração não forem positivos."""
+    if size <= 0 or segundos <= 0:
+        return 0
+    return int(size / segundos)
+
+
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
     name = name.strip('. ')
@@ -946,6 +953,7 @@ async def download_media_from_group(
             logger.info("Iniciando [%d/%d] %s%s", item_index, len(pending), file_name, size_str)
             live.log(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
 
+            inicio = time.time()
             if is_drive:
                 success = await download_with_retry(
                     client, group.entity, message_id, None, expected_size,
@@ -957,19 +965,19 @@ async def download_media_from_group(
                     client, group.entity, message_id, file_path_or_folder_id, expected_size,
                 )
 
+            duracao = time.time() - inicio
             async with counter_lock:
                 if success:
                     downloaded += 1
                     if is_drive:
-                        download_log[group_log_key]["downloaded"][str(message_id)] = {
-                            "file": file_name,
-                            "size": expected_size or 0,
-                        }
+                        size = expected_size or 0
                     else:
-                        download_log[group_log_key]["downloaded"][str(message_id)] = {
-                            "file": file_name,
-                            "size": file_path_or_folder_id.stat().st_size,
-                        }
+                        size = file_path_or_folder_id.stat().st_size
+                    download_log[group_log_key]["downloaded"][str(message_id)] = {
+                        "file": file_name,
+                        "size": size,
+                        "rate": calcular_rate(size, duracao),
+                    }
                     download_log[group_log_key]["stats"]["completed"] = len(download_log[group_log_key]["downloaded"])
                     logger.info("Concluído (%d/%d): %s", downloaded, len(pending), file_name)
                     if is_parallel:
