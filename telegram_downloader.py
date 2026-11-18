@@ -42,6 +42,9 @@ INITIAL_RETRY_DELAY = 5
 MAX_RETRY_DELAY = 300
 MAX_CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_DELAY = 1.0
+LIMITE_VAZAO_BPS = 0.5 * 1024 * 1024
+JANELA_VAZAO_S = 600
+MIN_ATIVOS_VAZAO = 5
 
 logger = logging.getLogger(__name__)
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -257,6 +260,55 @@ def classify_media(message) -> str | None:
         return "document"
 
     return None
+
+
+class MonitorVazao:
+    """Detecta rate limit: vazão agregada abaixo do limite numa janela deslizante, com downloads suficientes ativos."""
+
+    BUCKET_S = 60
+
+    def __init__(self, limite_bps: float = LIMITE_VAZAO_BPS, janela_s: float = JANELA_VAZAO_S,
+                 min_ativos: int = MIN_ATIVOS_VAZAO, relogio=time.time):
+        self.limite_bps = limite_bps
+        self.janela_s = janela_s
+        self.min_ativos = min_ativos
+        self.relogio = relogio
+        self.avisado = False
+        self.vazao_bps = 0.0
+        self._amostras: list[tuple[float, int, int]] = []
+        self._t0: float | None = None
+        self._disparou = False
+
+    def registrar(self, delta_bytes: int, ativos: int) -> None:
+        agora = self.relogio()
+        if self._t0 is None:
+            self._t0 = agora
+        self._amostras.append((agora, delta_bytes, ativos))
+        corte = agora - self.janela_s
+        while self._amostras and self._amostras[0][0] < corte:
+            self._amostras.pop(0)
+
+    def lento(self) -> bool:
+        if self._disparou:
+            return True
+        agora = self.relogio()
+        if self._t0 is None or agora - self._t0 < self.janela_s:
+            return False
+        total_buckets = max(1, int(self.janela_s // self.BUCKET_S))
+        buckets_ativos = set()
+        bytes_ativos = 0
+        for instante, delta, ativos in self._amostras:
+            if instante < agora - self.janela_s or ativos < self.min_ativos:
+                continue
+            buckets_ativos.add(min(total_buckets - 1, int((agora - instante) // self.BUCKET_S)))
+            bytes_ativos += delta
+        if len(buckets_ativos) * 2 < total_buckets:
+            return False
+        self.vazao_bps = bytes_ativos / (len(buckets_ativos) * self.BUCKET_S)
+        if self.vazao_bps < self.limite_bps:
+            self._disparou = True
+            return True
+        return False
 
 
 class LiveProgress:
