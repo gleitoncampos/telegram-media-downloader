@@ -1221,6 +1221,14 @@ def run_post_actions(actions: set[str], summary: str):
         subprocess.run(cmd, check=False)
 
 
+def grupo_interrompido(monitor, nome_grupo: str, download_log: dict) -> bool:
+    """True se o freio de rate limit disparou e o grupo ficou com pendências."""
+    if not monitor.lento():
+        return False
+    entrada = download_log.get(sanitize_filename(nome_grupo)) or {}
+    return entrada.get("scan", {}).get("pendentes", 0) > 0
+
+
 async def main():
     setup_logging()
     api_id, api_hash = load_credentials()
@@ -1391,16 +1399,25 @@ async def main():
         log_selection(queue, MEDIA_FILTERS[media_choice]["label"], limit, destination, course_structure, post_actions)
 
         failed_groups: list[str] = []
+        monitor = MonitorVazao()
+        live.monitor = monitor
+        interrompidos: list[str] = []
         for pos, selected in enumerate(queue, 1):
+            if monitor.lento():
+                interrompidos.append(selected.name)
+                continue
             if is_queue:
                 print(f"\n{'#'*50}\n  FILA [{pos}/{len(queue)}]: {selected.name}\n{'#'*50}\n")
             try:
                 errs = await download_media_from_group(
                     client, selected, media_types, limit, base_dir, course_structure,
                     drive_service, drive_root_folder_id, interactive=not is_queue,
+                    monitor=monitor,
                 )
                 if errs:
                     failed_groups.append(selected.name)
+                if grupo_interrompido(monitor, selected.name, load_download_log()):
+                    interrompidos.append(selected.name)
             except (ConnectionError, TimeoutError, OSError) as e:
                 failed_groups.append(selected.name)
                 logger.error("Conexão perdida durante download: %s", e)
@@ -1421,15 +1438,23 @@ async def main():
                 await asyncio.sleep(wait_time)
                 print("   ✅ Tempo de espera concluído. Rode novamente para continuar.\n")
 
+        sem_falha = len(queue) - len(set(failed_groups) | set(interrompidos))
+        if interrompidos:
+            print(f"\n⏸  Interrompido por rate limit (rode de novo mais tarde):")
+            for name in interrompidos:
+                print(f"  ⏸  {name}")
+
         if is_queue:
-            print(f"\n{'='*50}\n  FILA CONCLUÍDA: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha")
+            print(f"\n{'='*50}\n  FILA CONCLUÍDA: {sem_falha}/{len(queue)} grupos sem falha")
             for name in failed_groups:
                 print(f"  ❌ com falha: {name}")
             print(f"{'='*50}")
 
         if post_actions != {"1"}:
             await client.disconnect()
-            summary = f"Download concluído: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha"
+            summary = f"Download concluído: {sem_falha}/{len(queue)} grupos sem falha"
+            if interrompidos:
+                summary += f" | {len(interrompidos)} interrompido(s) por rate limit"
             run_post_actions(post_actions, summary)
             print("\n👋 Até mais!")
             return
