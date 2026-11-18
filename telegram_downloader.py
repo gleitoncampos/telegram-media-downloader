@@ -1118,6 +1118,28 @@ def estado_final(errs: int | None, entrada_log: dict | None) -> str:
     return "interrompido"
 
 
+def resolver_grupos(lote: dict, groups: list) -> tuple[list, list[str]]:
+    """Acha os grupos não concluídos do lote: por ID, depois por nome exato (só se for único).
+
+    Devolve (encontrados, ausentes). Atualiza id e nome no próprio lote com os do grupo achado.
+    """
+    encontrados, ausentes = [], []
+    for item in lote["grupos"]:
+        if item["estado"] == "concluido":
+            continue
+        achado = next((g for g in groups if g.id == item["id"]), None)
+        if achado is None:
+            nome = sanitize_filename(item["nome"])
+            iguais = [g for g in groups if sanitize_filename(g.name or "") == nome]
+            achado = iguais[0] if len(iguais) == 1 else None
+        if achado is None:
+            ausentes.append(item["nome"])
+            continue
+        item["id"], item["nome"] = achado.id, achado.name
+        encontrados.append(achado)
+    return encontrados, ausentes
+
+
 async def pedir_destino() -> str | None:
     """Pasta de destino: escolhe um dos últimos (setas) ou digita outro. '' = padrão; None = sair."""
     recentes = carregar_destinos()
