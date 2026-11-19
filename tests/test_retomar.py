@@ -31,7 +31,7 @@ def ctx(t, tmp_path, monkeypatch):
                         drive_service, drive_root_folder_id, interativo, lote=None):
         chamadas.append({"queue": queue, "media_types": media_types, "limit": limit,
                          "base_dir": base_dir, "interativo": interativo, "lote": lote})
-        return []
+        return [], []
 
     monkeypatch.setattr(t, "list_groups", fake_list_groups)
     monkeypatch.setattr(t, "executar_fila", fake_fila)

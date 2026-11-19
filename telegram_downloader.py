@@ -1310,10 +1310,18 @@ def run_post_actions(actions: set[str], summary: str):
 async def executar_fila(client, queue: list, media_types: list[str], limit: int | None,
                         base_dir: Path | None, course_structure: dict | None,
                         drive_service, drive_root_folder_id, interativo: bool,
-                        lote: dict | None = None) -> list[str]:
-    """Baixa cada grupo da fila em ordem; devolve os nomes dos que falharam. Com lote, registra o estado de cada grupo."""
+                        lote: dict | None = None,
+                        monitor: MonitorVazao | None = None) -> tuple[list[str], list[str]]:
+    """Baixa cada grupo da fila em ordem; devolve (nomes que falharam, nomes interrompidos pelo freio de rate limit).
+    Com lote, registra o estado de cada grupo; grupo pulado pelo freio sem iniciar continua pendente."""
+    monitor = monitor or MonitorVazao()
+    live.monitor = monitor
     failed_groups: list[str] = []
+    interrompidos: list[str] = []
     for pos, selected in enumerate(queue, 1):
+        if monitor.lento():
+            interrompidos.append(selected.name)
+            continue
         if not interativo:
             print(f"\n{'#'*50}\n  FILA [{pos}/{len(queue)}]: {selected.name}\n{'#'*50}\n")
         errs = None
@@ -1323,9 +1331,12 @@ async def executar_fila(client, queue: list, media_types: list[str], limit: int 
             errs = await download_media_from_group(
                 client, selected, media_types, limit, base_dir, course_structure,
                 drive_service, drive_root_folder_id, interactive=interativo,
+                monitor=monitor,
             )
             if errs:
                 failed_groups.append(selected.name)
+            if grupo_interrompido(monitor, selected.name, load_download_log()):
+                interrompidos.append(selected.name)
         except (ConnectionError, TimeoutError, OSError) as e:
             failed_groups.append(selected.name)
             logger.error("Conexão perdida durante download: %s", e)
@@ -1352,7 +1363,7 @@ async def executar_fila(client, queue: list, media_types: list[str], limit: int 
                     estado_final(errs, load_download_log().get(sanitize_filename(selected.name))),
                 )
 
-    return failed_groups
+    return failed_groups, interrompidos
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1400,22 +1411,30 @@ async def retomar(client) -> int:
     print()
 
     failed_groups: list[str] = []
+    interrompidos: list[str] = []
     if encontrados:
-        failed_groups = await executar_fila(
+        failed_groups, interrompidos = await executar_fila(
             client, encontrados, MEDIA_FILTERS[lote["midia"]]["types"], limit, base_dir,
             course_structure, None, None, interativo=False, lote=lote,
         )
-        print(f"\n{'='*50}\n  RETOMADA CONCLUÍDA: {len(encontrados) - len(failed_groups)}/{len(encontrados)} grupos sem falha")
+        sem_falha = len(encontrados) - len(set(failed_groups) | set(interrompidos))
+        if interrompidos:
+            print(f"\n⏸  Interrompido por rate limit (rode de novo mais tarde):")
+            for name in interrompidos:
+                print(f"  ⏸  {name}")
+        print(f"\n{'='*50}\n  RETOMADA CONCLUÍDA: {sem_falha}/{len(encontrados)} grupos sem falha")
         for name in failed_groups:
             print(f"  ❌ com falha: {name}")
         print(f"{'='*50}")
 
     if acoes != {"1"}:
         await client.disconnect()
-        summary = f"Retomada concluída: {len(encontrados) - len(failed_groups)}/{len(encontrados)} grupos sem falha"
+        summary = f"Retomada concluída: {len(encontrados) - len(set(failed_groups) | set(interrompidos))}/{len(encontrados)} grupos sem falha"
+        if interrompidos:
+            summary += f" | {len(interrompidos)} interrompido(s) por rate limit"
         run_post_actions(acoes, summary)
 
-    return 1 if ausentes or failed_groups else 0
+    return 1 if ausentes or failed_groups or interrompidos else 0
 
 
 def grupo_interrompido(monitor, nome_grupo: str, download_log: dict) -> bool:
@@ -1609,11 +1628,10 @@ async def main(argv: list[str] | None = None) -> int | None:
         )
         salvar_lote(lote)
 
-        failed_groups = await executar_fila(
+        failed_groups, interrompidos = await executar_fila(
             client, queue, media_types, limit, base_dir, course_structure,
             drive_service, drive_root_folder_id, interativo=not is_queue, lote=lote,
         )
-        interrompidos: list[str] = []  # ponte temporária do merge; a Task 2 move o freio para executar_fila
 
         sem_falha = len(queue) - len(set(failed_groups) | set(interrompidos))
         if interrompidos:
