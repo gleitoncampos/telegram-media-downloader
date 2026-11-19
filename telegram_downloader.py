@@ -43,6 +43,9 @@ INITIAL_RETRY_DELAY = 5
 MAX_RETRY_DELAY = 300
 MAX_CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_DELAY = 1.0
+LIMITE_VAZAO_BPS = 0.5 * 1024 * 1024
+JANELA_VAZAO_S = 600
+MIN_ATIVOS_VAZAO = 5
 
 logger = logging.getLogger(__name__)
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -172,6 +175,13 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def calcular_rate(size: int, segundos: float) -> int:
+    """Taxa média em bytes/s; 0 se o tamanho ou a duração não forem positivos."""
+    if size <= 0 or segundos <= 0:
+        return 0
+    return int(size / segundos)
+
+
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
     name = name.strip('. ')
@@ -260,6 +270,55 @@ def classify_media(message) -> str | None:
     return None
 
 
+class MonitorVazao:
+    """Detecta rate limit: vazão agregada abaixo do limite numa janela deslizante, com downloads suficientes ativos."""
+
+    BUCKET_S = 60
+
+    def __init__(self, limite_bps: float = LIMITE_VAZAO_BPS, janela_s: float = JANELA_VAZAO_S,
+                 min_ativos: int = MIN_ATIVOS_VAZAO, relogio=time.time):
+        self.limite_bps = limite_bps
+        self.janela_s = janela_s
+        self.min_ativos = min_ativos
+        self.relogio = relogio
+        self.avisado = False
+        self.vazao_bps = 0.0
+        self._amostras: list[tuple[float, int, int]] = []
+        self._t0: float | None = None
+        self._disparou = False
+
+    def registrar(self, delta_bytes: int, ativos: int) -> None:
+        agora = self.relogio()
+        if self._t0 is None:
+            self._t0 = agora
+        self._amostras.append((agora, delta_bytes, ativos))
+        corte = agora - self.janela_s
+        while self._amostras and self._amostras[0][0] < corte:
+            self._amostras.pop(0)
+
+    def lento(self) -> bool:
+        if self._disparou:
+            return True
+        agora = self.relogio()
+        if self._t0 is None or agora - self._t0 < self.janela_s:
+            return False
+        total_buckets = max(1, int(self.janela_s // self.BUCKET_S))
+        buckets_ativos = set()
+        bytes_ativos = 0
+        for instante, delta, ativos in self._amostras:
+            if instante < agora - self.janela_s or ativos < self.min_ativos:
+                continue
+            buckets_ativos.add(min(total_buckets - 1, int((agora - instante) // self.BUCKET_S)))
+            bytes_ativos += delta
+        if len(buckets_ativos) * 2 < total_buckets:
+            return False
+        self.vazao_bps = bytes_ativos / (len(buckets_ativos) * self.BUCKET_S)
+        if self.vazao_bps < self.limite_bps:
+            self._disparou = True
+            return True
+        return False
+
+
 class LiveProgress:
     """Bloco fixo no fim do terminal com uma linha (barra, %, velocidade, ETA) por download ativo."""
 
@@ -273,6 +332,7 @@ class LiveProgress:
         self._drawn_lines = 0
         self._last_draw = 0.0
         self.enabled = sys.stdout.isatty()
+        self.monitor = None
 
     def start(self, name: str):
         self._next_id += 1
@@ -280,7 +340,7 @@ class LiveProgress:
         now = time.time()
         self.active[task_id] = {
             "name": name, "current": 0, "total": 0,
-            "last_time": now, "last_bytes": 0, "speed": 0.0,
+            "last_time": now, "last_bytes": 0, "speed": 0.0, "reportado": 0,
         }
         self._draw(force=True)
 
@@ -301,6 +361,9 @@ class LiveProgress:
 
     def _update(self, task_id: int, current: int, total: int):
         task = self.active.get(task_id)
+        if self.monitor and task:
+            self.monitor.registrar(current - task["reportado"], len(self.active))
+            task["reportado"] = current
         if task is None or total <= 0:
             return
         now = time.time()
@@ -758,7 +821,7 @@ async def download_media_from_group(
     client: TelegramClient, group, media_types: list[str], limit: int | None,
     base_dir: Path | None = None, course_structure: dict | None = None,
     drive_service=None, drive_root_folder_id: str | None = None,
-    interactive: bool = True,
+    interactive: bool = True, monitor: MonitorVazao | None = None,
 ) -> int:
     """Baixa a mídia de um grupo. Retorna o número de falhas (0 = tudo certo).
 
@@ -873,6 +936,17 @@ async def download_media_from_group(
         nonlocal downloaded, error_count
 
         async with semaphore:
+            if monitor is not None and monitor.lento():
+                if not monitor.avisado:
+                    monitor.avisado = True
+                    aviso = (
+                        f"⏸  Rate limit detectado (vazão {monitor.vazao_bps / 1024 / 1024:.2f} MB/s "
+                        "na janela de 10 min): não inicio novos downloads"
+                    )
+                    logger.warning(aviso)
+                    live.log(aviso)
+                return
+
             if is_parallel:
                 await asyncio.sleep(DOWNLOAD_DELAY)
 
@@ -880,6 +954,7 @@ async def download_media_from_group(
             logger.info("Iniciando [%d/%d] %s%s", item_index, len(pending), file_name, size_str)
             live.log(f"⬇  [{item_index}/{len(pending)}] [{media_type.upper()}] {file_name}{size_str}")
 
+            inicio = time.time()
             if is_drive:
                 success = await download_with_retry(
                     client, group.entity, message_id, None, expected_size,
@@ -891,19 +966,19 @@ async def download_media_from_group(
                     client, group.entity, message_id, file_path_or_folder_id, expected_size,
                 )
 
+            duracao = time.time() - inicio
             async with counter_lock:
                 if success:
                     downloaded += 1
                     if is_drive:
-                        download_log[group_log_key]["downloaded"][str(message_id)] = {
-                            "file": file_name,
-                            "size": expected_size or 0,
-                        }
+                        size = expected_size or 0
                     else:
-                        download_log[group_log_key]["downloaded"][str(message_id)] = {
-                            "file": file_name,
-                            "size": file_path_or_folder_id.stat().st_size,
-                        }
+                        size = file_path_or_folder_id.stat().st_size
+                    download_log[group_log_key]["downloaded"][str(message_id)] = {
+                        "file": file_name,
+                        "size": size,
+                        "rate": calcular_rate(size, duracao),
+                    }
                     download_log[group_log_key]["stats"]["completed"] = len(download_log[group_log_key]["downloaded"])
                     logger.info("Concluído (%d/%d): %s", downloaded, len(pending), file_name)
                     if is_parallel:
@@ -1343,6 +1418,14 @@ async def retomar(client) -> int:
     return 1 if ausentes or failed_groups else 0
 
 
+def grupo_interrompido(monitor, nome_grupo: str, download_log: dict) -> bool:
+    """True se o freio de rate limit disparou e o grupo ficou com pendências."""
+    if not monitor.lento():
+        return False
+    entrada = download_log.get(sanitize_filename(nome_grupo)) or {}
+    return entrada.get("scan", {}).get("pendentes", 0) > 0
+
+
 async def main(argv: list[str] | None = None) -> int | None:
     args = parse_args(argv)
 
@@ -1530,16 +1613,25 @@ async def main(argv: list[str] | None = None) -> int | None:
             client, queue, media_types, limit, base_dir, course_structure,
             drive_service, drive_root_folder_id, interativo=not is_queue, lote=lote,
         )
+        interrompidos: list[str] = []  # ponte temporária do merge; a Task 2 move o freio para executar_fila
+
+        sem_falha = len(queue) - len(set(failed_groups) | set(interrompidos))
+        if interrompidos:
+            print(f"\n⏸  Interrompido por rate limit (rode de novo mais tarde):")
+            for name in interrompidos:
+                print(f"  ⏸  {name}")
 
         if is_queue:
-            print(f"\n{'='*50}\n  FILA CONCLUÍDA: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha")
+            print(f"\n{'='*50}\n  FILA CONCLUÍDA: {sem_falha}/{len(queue)} grupos sem falha")
             for name in failed_groups:
                 print(f"  ❌ com falha: {name}")
             print(f"{'='*50}")
 
         if post_actions != {"1"}:
             await client.disconnect()
-            summary = f"Download concluído: {len(queue) - len(failed_groups)}/{len(queue)} grupos sem falha"
+            summary = f"Download concluído: {sem_falha}/{len(queue)} grupos sem falha"
+            if interrompidos:
+                summary += f" | {len(interrompidos)} interrompido(s) por rate limit"
             run_post_actions(post_actions, summary)
             print("\n👋 Até mais!")
             return
