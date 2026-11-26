@@ -11,8 +11,8 @@
 #   # 2) escolher os canais (grava ~/tmd-data/ultimo_lote.json)
 #   docker run -it --rm --user "$(id -u):$(id -g)" -v ~/tmd-data:/data -v ~/dl:/downloads tmd --prepare
 #
-#   # 3) baixar o lote em ~/dl, sem terminal
-#   docker run --rm --user "$(id -u):$(id -g)" -v ~/tmd-data:/data -v ~/dl:/downloads tmd --resume
+#   # 3) baixar o lote em ~/dl (-t é só para a barra de progresso aparecer; sem ele a tela fica muda)
+#   docker run -t --rm --user "$(id -u):$(id -g)" -v ~/tmd-data:/data -v ~/dl:/downloads tmd --resume
 #
 # Segredo e estado ficam nos volumes, nunca na imagem.
 FROM python:3.12-slim
