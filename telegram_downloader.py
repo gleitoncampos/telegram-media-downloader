@@ -1375,9 +1375,35 @@ async def executar_fila(client, queue: list, media_types: list[str], limit: int 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Telegram Group Downloader")
-    parser.add_argument("--resume", action="store_true",
-                        help="retoma, sem perguntar nada, os grupos que não terminaram no último lote")
+    modo = parser.add_mutually_exclusive_group()
+    modo.add_argument("--resume", action="store_true",
+                      help="retoma, sem perguntar nada, os grupos que não terminaram no último lote")
+    modo.add_argument("--prepare", action="store_true",
+                      help="só escolhe os canais e grava o lote (mídia: tudo, destino /downloads) para o --resume baixar")
     return parser.parse_args(argv)
+
+
+DESTINO_CONTAINER = "/downloads"
+
+
+async def preparar(client) -> int:
+    """Grava o lote com os canais marcados, para o --resume baixar. Códigos: 0 gravou, 2 nada selecionado."""
+    print("🔄 Carregando seus grupos/canais...\n")
+    groups = await list_groups(client)
+    if not groups:
+        print("❌ Nenhum grupo ou canal encontrado.")
+        return 2
+
+    download_log = load_download_log()
+    await completar_scans_legados(client, groups, download_log)
+    queue = await escolher_grupos(groups, download_log)
+    if not queue:
+        print("❌ Nenhum grupo selecionado, lote não alterado.")
+        return 2
+
+    salvar_lote(novo_lote("4", None, DESTINO_CONTAINER, False, {"1"}, queue))
+    print(f"\n✅ Lote gravado com {len(queue)} grupo(s). Rode com --resume para baixar.")
+    return 0
 
 
 async def retomar(client) -> int:
@@ -1493,6 +1519,12 @@ async def main(argv: list[str] | None = None) -> int | None:
     if args.resume:
         try:
             return await retomar(client)
+        finally:
+            await client.disconnect()
+
+    if args.prepare:
+        try:
+            return await preparar(client)
         finally:
             await client.disconnect()
 
