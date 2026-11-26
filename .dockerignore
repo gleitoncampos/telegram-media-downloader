@@ -1,0 +1,14 @@
+config.json
+*.session*
+downloads/
+venv/
+ultimo_lote.json
+ultimos_destinos.json
+download_log.json
+downloader.log
+logs/
+drive_*.json
+tests/
+.git/
+__pycache__/
+.env
