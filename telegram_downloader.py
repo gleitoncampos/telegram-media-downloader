@@ -16,6 +16,7 @@ import logging
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import questionary
@@ -33,9 +34,15 @@ from telethon.tl.types import (
     MessageMediaPhoto,
 )
 
-SESSION_NAME = "telegram_session"
-CONFIG_FILE = Path(__file__).parent / "config.json"
-LOG_FILE = Path(__file__).parent / "download_log.json"
+def resolver_data_dir(env: Mapping[str, str]) -> Path:
+    """Onde ficam config, sessão, log e lote: TMD_DATA_DIR, ou a pasta do script se vazia/ausente."""
+    return Path(env.get("TMD_DATA_DIR") or Path(__file__).parent)
+
+
+DATA_DIR = resolver_data_dir(os.environ)
+SESSION_NAME = str(DATA_DIR / "telegram_session")
+CONFIG_FILE = DATA_DIR / "config.json"
+LOG_FILE = DATA_DIR / "download_log.json"
 COURSE_STRUCTURE_FILE = Path(__file__).parent / "course_structure.json"
 
 MAX_RETRIES = 5
@@ -48,7 +55,7 @@ JANELA_VAZAO_S = 600
 MIN_ATIVOS_VAZAO = 5
 
 logger = logging.getLogger(__name__)
-LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR = DATA_DIR / "logs"
 
 
 def setup_logging() -> Path:
@@ -1117,7 +1124,7 @@ async def escolher_grupos(groups, download_log: dict | None = None) -> list | No
 
 DESTINOS_FILE = Path(__file__).parent / "ultimos_destinos.json"
 MAX_DESTINOS = 10
-LOTE_FILE = Path(__file__).parent / "ultimo_lote.json"
+LOTE_FILE = DATA_DIR / "ultimo_lote.json"
 _NOVO_DESTINO = object()
 
 
