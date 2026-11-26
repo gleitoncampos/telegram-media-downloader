@@ -132,6 +132,20 @@ def resolve_folder_from_message(message_text: str | None, structure: dict) -> st
     return None
 
 
+def erro_de_ambiente(prepare: bool, config_file: Path, session_file: Path, tem_tty: bool) -> str | None:
+    """Mensagem de erro se --prepare/--resume não puderem rodar neste ambiente; None se podem."""
+    if tem_tty:
+        return None
+    if prepare:
+        return "--prepare precisa de terminal interativo (docker run -it)."
+    if not config_file.exists():
+        return f"Sem terminal e sem config.json em {config_file.parent} (TMD_DATA_DIR)."
+    if not session_file.exists():
+        return ("Sem sessão do Telegram: faça o login uma vez com docker run -it, "
+                "sem --prepare nem --resume.")
+    return None
+
+
 def load_credentials() -> tuple[str, str]:
     if CONFIG_FILE.exists():
         data = json.loads(CONFIG_FILE.read_text())
@@ -1480,6 +1494,14 @@ def grupo_interrompido(monitor, nome_grupo: str, download_log: dict) -> bool:
 
 async def main(argv: list[str] | None = None) -> int | None:
     args = parse_args(argv)
+
+    if args.prepare or args.resume:
+        erro = erro_de_ambiente(
+            args.prepare, CONFIG_FILE, Path(SESSION_NAME + ".session"), sys.stdin.isatty(),
+        )
+        if erro:
+            print(f"❌ {erro}")
+            return 2
 
     setup_logging()
     api_id, api_hash = load_credentials()
